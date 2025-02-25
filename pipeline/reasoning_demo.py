@@ -1,21 +1,20 @@
-# %% [markdown]
 # # Reasoning Direction
-# 
+#
 # This notebook aims to estimate the "reasoning" direction within the LLM activation space.
 # We're basing this approach on the methodology used to find the "refusal" direction, but with a key difference:
-# 
+#
 # - **Refusal paper approach**: Used 1 LLM with 2 types of prompts (harmful vs harmless)
 # - **Our approach**: Use 2 models (original vs reasoning-tuned) with the same prompts (GSM8K math problems)
-# 
+#
 # We'll collect activations from both models, calculate the difference (reasoning direction),
 # and then test if adding this direction to the non-reasoning model enhances its reasoning capabilities.
 
-# %%
 # Setup and imports
-%%capture
-!pip install transformers transformers_stream_generator tiktoken transformer_lens einops jaxtyping colorama scikit-learn datasets
+# !pip install transformers transformers_stream_generator tiktoken transformer_lens einops jaxtyping colorama scikit-learn datasets
 
-# %%
+# !pip uninstall numpy -y
+
+# +
 import torch
 import functools
 import einops
@@ -41,39 +40,31 @@ from huggingface_hub import snapshot_download
 
 # We turn off automatic differentiation to save GPU memory
 torch.set_grad_enabled(False)
+# -
 
-# %% [markdown]
 # ## Load models
-# 
+#
 # We'll load both the original model and the reasoning-tuned model using HookedTransformer.
 # If using a HuggingFace model, we can download it directly. If using a local model, make sure it's 
 # in the correct directory structure.
 
-# %%
 # Define model paths - adjust these based on your models
-MODEL_PATH_ORIGINAL = "meta-llama/Llama-3.1-8B"  # Non-reasoning model
+MODEL_PATH_ORIGINAL = "meta-llama/Llama-3.1-8B-Instruct"  # Non-reasoning model
 MODEL_PATH_REASONING = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"  # Reasoning model
 
-# %% [markdown]
-# ### Optional: Download the models if needed
-# This step can be skipped if you already have the models locally
-
-# %%
-# Uncomment this to download the reasoning model
-# model_path = snapshot_download(
-#     repo_id=MODEL_PATH_REASONING,
-#     local_dir=MODEL_PATH_REASONING,
-#     local_dir_use_symlinks=False
-# )
-
-# %% [markdown]
 # ### Load both models
 
-# %%
+# +
+# Login to HuggingFace
+from huggingface_hub import login
+
+# Replace with your HF token from https://huggingface.co/settings/tokens
+login(token="") 
+
+# +
 # Load the original (non-reasoning) model
 model_original = HookedTransformer.from_pretrained_no_processing(
     MODEL_PATH_ORIGINAL,
-    local_files_only=True,  # Set to True if using local models
     dtype=torch.bfloat16,
     default_padding_side='left'
 )
@@ -81,11 +72,27 @@ model_original.tokenizer.padding_side = 'left'
 model_original.tokenizer.pad_token = model_original.tokenizer.eos_token
 
 print(f"Loaded non-reasoning model {MODEL_PATH_ORIGINAL}")
+# -
 
-# %%
+# free cuda memory
+torch.cuda.empty_cache()
+gc.collect()
+
+
+# #### Optional: Download the reasoning model if needed
+# This step can be skipped if you already have the models locally
+
+# Uncomment this to download the reasoning model
+model_path = snapshot_download(
+    repo_id=MODEL_PATH_REASONING,
+    local_dir=MODEL_PATH_ORIGINAL,
+    local_dir_use_symlinks=False
+)
+
+# +
 # Load the reasoning model
 model_reasoning = HookedTransformer.from_pretrained_no_processing(
-    MODEL_PATH_REASONING,
+    MODEL_PATH_ORIGINAL,
     local_files_only=True,  # Set to True if using local models
     dtype=torch.bfloat16,
     default_padding_side='left'
@@ -95,13 +102,35 @@ model_reasoning.tokenizer.pad_token = model_reasoning.tokenizer.eos_token
 
 print(f"Loaded reasoning model {MODEL_PATH_REASONING}")
 
-# %% [markdown]
+# +
+# Test both models with a simple math problem
+test_prompt = "What is 5*125?"
+
+# Test original model
+print("Original model response:")
+output_original = model_original.generate(
+    test_prompt, 
+    temperature=0.0,
+    max_new_tokens=100  # Increase max tokens to generate longer response
+)
+print(output_original)
+
+print("\nReasoning model response:") 
+output_reasoning = model_reasoning.generate(
+    test_prompt,
+    temperature=0.0,
+    max_new_tokens=100  # Increase max tokens to generate longer response
+)
+print(output_reasoning)
+
+# -
+
 # ## Set up chat templates and data processing functions
-# 
+#
 # We need to define chat templates for both models and create functions to process our data.
 # Different models may have different chat templates, so we adjust accordingly.
 
-# %%
+# +
 # Define chat templates for both models
 # Adjust these templates based on your specific models
 ORIGINAL_CHAT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_id|>
@@ -110,7 +139,7 @@ ORIGINAL_CHAT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header
 REASONING_CHAT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_id|>
 {instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""  # DeepSeek template
 
-# %%
+# +
 # Define utility functions for processing data and collecting activations
 
 def tokenize_instructions(
@@ -157,13 +186,15 @@ def collect_activations(
     activations = {k: torch.cat(v) for k, v in activations.items()}
     return activations
 
-# %% [markdown]
+
+# -
+
 # ## Load and prepare GSM8K dataset
-# 
+#
 # We'll use the GSM8K dataset which contains math problems that require reasoning to solve.
 # We'll append "please provide your answer first, then your reasoning" to each problem.
 
-# %%
+# +
 # Load GSM8K dataset
 gsm8k = load_dataset("gsm8k", "main")
 print(f"Loaded GSM8K dataset with {len(gsm8k['train'])} training examples and {len(gsm8k['test'])} test examples")
@@ -174,7 +205,7 @@ print(gsm8k["train"][0]["question"])
 print("\nSample answer:")
 print(gsm8k["train"][0]["answer"])
 
-# %%
+# +
 # Define functions to prepare prompts
 def prepare_prompts(problems: List[str]) -> List[str]:
     """Add the reasoning instruction to each problem."""
@@ -193,14 +224,14 @@ train_prompts = prepare_prompts(train_problems)
 test_prompts = prepare_prompts(test_problems)
 
 print(f"Prepared {len(train_prompts)} training prompts and {len(test_prompts)} test prompts")
+# -
 
-# %% [markdown]
 # ## Collect activations from both models
-# 
+#
 # Now we'll run the same prompts through both models and collect their activations.
 # This is the key step where we gather the data needed to compute the reasoning direction.
 
-# %%
+# +
 # Tokenize the math problems for both models
 tokenized_prompts_original = tokenize_instructions(
     model_original.tokenizer, 
@@ -216,12 +247,12 @@ tokenized_prompts_reasoning = tokenize_instructions(
 
 print(f"Tokenized prompts shape (original): {tokenized_prompts_original.shape}")
 print(f"Tokenized prompts shape (reasoning): {tokenized_prompts_reasoning.shape}")
+# -
 
-# %% [markdown]
 # ### Collect activations (this may take a while)
 # We'll run both models on the same inputs and collect their activations.
 
-# %%
+# +
 print("Collecting activations from the original model...")
 original_activations = collect_activations(model_original, tokenized_prompts_original)
 print("Done collecting activations from the original model")
@@ -234,13 +265,15 @@ print("Done collecting activations from the reasoning model")
 torch.save(original_activations, 'original_activations.pth')
 torch.save(reasoning_activations, 'reasoning_activations.pth')
 
-# %% [markdown]
+
+# -
+
 # ## Calculate the reasoning direction
-# 
+#
 # Now we'll calculate the reasoning direction by taking the difference between
 # activations from the reasoning model and the original model.
 
-# %%
+# +
 def get_act_idx(cache_dict, act_name, layer):
     """Helper function to get activations from a specific layer."""
     key = (act_name, layer,)
@@ -269,14 +302,14 @@ for layer_num in tqdm(range(1, model_original.cfg.n_layers)):
 # Save the reasoning directions
 torch.save(reasoning_directions, 'reasoning_dirs.pth')
 print("Reasoning directions calculated and saved")
+# -
 
-# %% [markdown]
 # ## Score and rank reasoning directions
-# 
+#
 # Now we'll sort the reasoning directions by their magnitude to identify
 # which layers might have the strongest reasoning signal.
 
-# %%
+# +
 # Get all calculated potential reasoning dirs, sort them in descending order
 # based on their mean() magnitude
 activation_layers = ['resid_pre']  # We can start with just this layer as it's often sufficient
@@ -290,13 +323,15 @@ activation_scored = sorted(
 
 print(f"Ranked {len(activation_scored)} potential reasoning directions")
 
-# %% [markdown]
+
+# -
+
 # ## Test the reasoning direction
-# 
+#
 # Now we'll define a hook to add the reasoning direction to the model's activations
 # during inference and test if it enhances the model's reasoning capabilities.
 
-# %%
+# +
 def reasoning_enhancement_hook(
     activation: Float[Tensor, "... d_act"],
     hook: HookPoint,
@@ -334,13 +369,15 @@ def generate_with_hooks(
     
     return model.tokenizer.batch_decode(all_toks[:, toks.shape[1]:], skip_special_tokens=True)
 
-# %% [markdown]
+
+# -
+
 # ## Evaluate the reasoning enhancement
-# 
+#
 # Now we'll test our reasoning direction on a few example problems and compare
 # the baseline model outputs with the reasoning-enhanced outputs.
 
-# %%
+# +
 # Select the top reasoning direction to test
 top_reasoning_dir = activation_scored[0]
 print("Selected top reasoning direction for testing")
@@ -356,7 +393,7 @@ fwd_hooks = [
     for act_name in ['resid_pre', 'resid_mid', 'resid_post']
 ]
 
-# %%
+# +
 # Test on a few examples
 N_TEST_EXAMPLES = 3
 print(f"Testing on {N_TEST_EXAMPLES} examples from the test set")
@@ -383,13 +420,14 @@ for i in range(N_TEST_EXAMPLES):
     print("\nREASONING-ENHANCED RESPONSE:")
     print(enhanced_response[0])
 
-# %% [markdown]
+
+# -
+
 # ## Systematic Evaluation
-# 
+#
 # To properly evaluate the effectiveness of our reasoning direction,
 # we'll test it on more examples and compare the quality of the responses.
 
-# %%
 def evaluate_reasoning(
     model: HookedTransformer,
     problems: List[str],
@@ -428,7 +466,6 @@ def evaluate_reasoning(
     
     return results
 
-# %%
 # Evaluate on a larger test set
 evaluation_results = evaluate_reasoning(
     model_original,
@@ -437,7 +474,6 @@ evaluation_results = evaluate_reasoning(
     reasoning_hooks=fwd_hooks
 )
 
-# %%
 # Print and analyze evaluation results
 for i, result in enumerate(evaluation_results):
     print(f"\n--- EVALUATION EXAMPLE {i+1} ---")
@@ -446,16 +482,15 @@ for i, result in enumerate(evaluation_results):
     print(f"\nREASONING-ENHANCED SOLUTION:\n{result['enhanced']}")
     print("-" * 80)
 
-# %% [markdown]
 # ## Future Directions
-# 
+#
 # Some potential improvements and extensions to this work:
-# 
+#
 # 1. **Fine-tune the strength parameter**: Experiment with different values of the strength parameter
 # 2. **Layer-specific intervention**: Apply the reasoning direction to specific layers only
 # 3. **Quantitative evaluation**: Develop metrics to measure reasoning quality
 # 4. **Orthogonalization**: Create a model with permanent reasoning enhancement by orthogonalizing the weights
 # 5. **Multiple reasoning directions**: Identify different aspects of reasoning (deduction, induction, etc.)
-# 
+#
 # This approach of comparing model activations to find meaningful directions in the activation space
 # could be extended to many other capabilities beyond reasoning.
